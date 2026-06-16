@@ -3,11 +3,116 @@
 use core::error::Error;
 use core::fmt::Write as _; // To be able to use the `Write` trait
 use core::fmt::{Display, Formatter};
+use core::time::Duration;
 use serde::Deserialize;
 use serde_repr::Deserialize_repr;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
-use tracing::{debug, error, instrument};
+use std::env;
+use std::sync::LazyLock;
+use tokio::time::sleep;
+use tracing::{debug, error, instrument, warn};
+
+/// Number of times a transient gitlab API error is retried before giving up
+/// (env `MAX_RETRIES`, default `4`; set to `0` to disable retrying)
+static MAX_RETRIES: LazyLock<u32> = LazyLock::new(|| {
+    env::var("MAX_RETRIES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4)
+});
+
+/// Base delay for the retry exponential backoff (env `RETRY_BACKOFF_MS`, default `500`)
+static RETRY_BACKOFF: LazyLock<Duration> = LazyLock::new(|| {
+    let millis: u64 = env::var("RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    Duration::from_millis(millis)
+});
+
+/// Upper bound for the backoff exponent, capping the per-attempt delay at 64x the base
+const MAX_BACKOFF_EXPONENT: u32 = 6;
+
+/// HTTP status codes worth retrying.
+///
+/// These are typically returned by an overloaded, restarting or rate-limiting
+/// gitlab instance and usually succeed on a subsequent attempt. Any other
+/// status (eg `401` or `404`) fails immediately, as retrying would not help.
+const RETRYABLE_STATUS: [u16; 5] = [429, 500, 502, 503, 504];
+
+/// Computes the capped exponential backoff delay before retry `attempt` (0-based)
+fn backoff_delay(attempt: u32) -> Duration {
+    let exponent = attempt.min(MAX_BACKOFF_EXPONENT);
+    let one: u32 = 1;
+    let multiplier = one.checked_shl(exponent).unwrap_or(u32::MAX);
+    RETRY_BACKOFF.saturating_mul(multiplier)
+}
+
+/// Performs an authenticated `GET`, retrying transient failures with exponential
+/// backoff.
+///
+/// A failure is considered transient when it is either a transport error
+/// (timeout / connection error) or one of the [`RETRYABLE_STATUS`] HTTP status
+/// codes; such failures are retried up to [`MAX_RETRIES`] times. On a final,
+/// non-retryable status error the response body is logged before returning,
+/// preserving the previous diagnostics.
+#[instrument(skip(http_client, token))]
+async fn get_with_retry(
+    http_client: &reqwest::Client,
+    url: &str,
+    token: &str,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let mut attempt: u32 = 0;
+
+    loop {
+        match http_client
+            .get(url)
+            .header("PRIVATE-TOKEN", token)
+            .send()
+            .await
+        {
+            Ok(resp) => match resp.error_for_status_ref() {
+                Ok(_) => return Ok(resp),
+                Err(status_err) => {
+                    let status = status_err.status().map_or(0, |code| code.as_u16());
+                    if RETRYABLE_STATUS.contains(&status) && attempt < *MAX_RETRIES {
+                        let backoff = backoff_delay(attempt);
+                        warn!(
+                            url,
+                            attempt = attempt.saturating_add(1),
+                            status,
+                            backoff_ms = backoff.as_millis(),
+                            "transient gitlab error, retrying after backoff"
+                        );
+                        sleep(backoff).await;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    error!("{url} - {status} : {body}");
+                    return Err(Box::new(status_err));
+                }
+            },
+            Err(send_err) => {
+                if (send_err.is_timeout() || send_err.is_connect()) && attempt < *MAX_RETRIES {
+                    let backoff = backoff_delay(attempt);
+                    warn!(
+                        url,
+                        attempt = attempt.saturating_add(1),
+                        error = %send_err,
+                        backoff_ms = backoff.as_millis(),
+                        "transient gitlab error, retrying after backoff"
+                    );
+                    sleep(backoff).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                return Err(Box::new(send_err));
+            }
+        }
+    }
+}
 
 /// cf <https://docs.gitlab.com/api/project_access_tokens/#create-a-project-access-token>
 #[derive(Debug, Deserialize_repr)]
@@ -149,37 +254,19 @@ pub trait OffsetBasedPagination<T: for<'serde> serde::Deserialize<'serde>> {
         let mut next_url: Option<String> = Some(url);
 
         while let Some(ref current_url) = next_url {
-            let resp = http_client
-                .get(current_url)
-                .header("PRIVATE-TOKEN", token)
-                .send()
-                .await?;
+            let resp = get_with_retry(http_client, current_url, token).await?;
 
-            let err_copy = resp.error_for_status_ref().map(|_| ()); // Keep the error for later if needed
-            match resp.error_for_status_ref() {
-                Ok(_) => {
-                    next_url = resp
-                        .headers()
-                        .get("link")
-                        .and_then(|header_value| header_value.to_str().ok())
-                        .and_then(|header_value_str| {
-                            parse_link_header::parse_with_rel(header_value_str).ok()
-                        })
-                        .and_then(|links| links.get("next").map(|link| link.raw_uri.clone()));
+            next_url = resp
+                .headers()
+                .get("link")
+                .and_then(|header_value| header_value.to_str().ok())
+                .and_then(|header_value_str| {
+                    parse_link_header::parse_with_rel(header_value_str).ok()
+                })
+                .and_then(|links| links.get("next").map(|link| link.raw_uri.clone()));
 
-                    let mut items: Vec<T> = resp.json().await?;
-                    result.append(&mut items);
-                }
-                Err(err) => {
-                    error!(
-                        "{} - {} : {}",
-                        current_url,
-                        err.status().unwrap_or_default(),
-                        resp.text().await?
-                    );
-                    err_copy?; // This will exit the function with the original error
-                }
-            }
+            let mut items: Vec<T> = resp.json().await?;
+            result.append(&mut items);
         }
 
         Ok(result)
@@ -370,12 +457,8 @@ pub async fn get_current_user(
 ) -> Result<User, Box<dyn Error + Send + Sync>> {
     let current_url = format!("https://{hostname}/api/v4/user");
 
-    Ok(http_client
-        .get(&current_url)
-        .header("PRIVATE-TOKEN", token)
-        .send()
+    Ok(get_with_retry(http_client, &current_url, token)
         .await?
-        .error_for_status()?
         .json::<User>()
         .await?)
 }
@@ -407,14 +490,9 @@ pub async fn get_group_full_path(
             // If not, querying gitlab
             Vacant(entry) => {
                 debug!("Getting group {parent_group_id} from gitlab");
-                let group_from_gitlab = http_client
-                    .get(format!(
-                        "https://{hostname}/api/v4/groups/{parent_group_id}"
-                    ))
-                    .header("PRIVATE-TOKEN", token)
-                    .send()
+                let group_url = format!("https://{hostname}/api/v4/groups/{parent_group_id}");
+                let group_from_gitlab = get_with_retry(http_client, &group_url, token)
                     .await?
-                    .error_for_status()?
                     .json::<Group>()
                     .await?;
 

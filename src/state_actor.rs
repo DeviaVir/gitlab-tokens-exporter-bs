@@ -71,11 +71,8 @@ async fn gitlab_get_data(
             .filter(|s| !s.is_empty())
             .collect());
 
-    // Create an HTTP client
-    let http_client = match reqwest::ClientBuilder::new()
-        .danger_accept_invalid_certs(accept_invalid_certs)
-        .build()
-    {
+    // Create an HTTP client (wrapped with transient-error retry middleware)
+    let http_client = match gitlab::build_http_client(accept_invalid_certs) {
         Ok(res) => res,
         Err(err) => {
             error!("{err}");

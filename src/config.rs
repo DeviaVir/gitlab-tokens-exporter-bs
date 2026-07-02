@@ -1,7 +1,7 @@
 //! Creates the exporter's [`Config`] in the static variable [`CONFIG`]
 
 use core::time::Duration;
-use std::{env, sync::LazyLock};
+use std::{collections::HashSet, env, sync::LazyLock};
 
 use anyhow::{Context as _, anyhow};
 use dotenvy::dotenv;
@@ -32,6 +32,9 @@ pub struct Config {
     pub connection: Connection,
     /// Time interval between updates
     pub data_refresh_hours: u8,
+    /// Optional allowlist of user, group, or project names/paths; when set, only
+    /// tokens for these entities are exported
+    pub gitlab_filter: Option<HashSet<String>>,
     /// Total (for **all** tasks) number of concurrent requests
     pub max_concurrent_requests: u16,
     /// Only handle owned tokens if set to `true`
@@ -91,6 +94,15 @@ impl Config {
             .and_then(|value| value.parse().ok())
             .unwrap_or(RETRY_BACKOFF_MS_DEFAULT);
 
+        // Checking GITLAB_FILTER env variable (comma-separated allowlist)
+        let gitlab_filter = env::var("GITLAB_FILTER").ok().map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect()
+        });
+
         let connection = Connection::new(
             hostname,
             token,
@@ -103,6 +115,7 @@ impl Config {
         Ok(Self {
             connection,
             data_refresh_hours,
+            gitlab_filter,
             max_concurrent_requests,
             owned_entities_only,
             skip_non_expiring_tokens,

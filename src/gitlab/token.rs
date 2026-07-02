@@ -1,7 +1,5 @@
 //! Defines the 2 kinds of gitlab token we interact with : [`AccessToken`] and [`PersonalAccessToken`]
-use anyhow::Context as _;
 use chrono::NaiveDate;
-use core::fmt::Write as _; // To be able to use the `write` macro
 use core::fmt::{Display, Formatter};
 use serde::Deserialize;
 use serde_repr::Deserialize_repr;
@@ -39,6 +37,10 @@ impl Display for AccessLevel {
 
 /// Defines a [gitlab access token](https://docs.gitlab.com/api/project_access_tokens/#list-project-access-tokens)
 #[derive(Debug, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "deserialized from the GitLab API; the stripped gitlab_token_expiration metric only exports a subset"
+)]
 pub struct AccessToken {
     /// Access level
     pub access_level: AccessLevel,
@@ -136,6 +138,10 @@ impl core::fmt::Display for AccessTokenScope {
 
 /// Defines a [gitlab personal access token](https://docs.gitlab.com/api/personal_access_tokens/#list-personal-access-tokens)
 #[derive(Debug, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "deserialized from the GitLab API; the stripped gitlab_token_expiration metric only exports a subset"
+)]
 pub struct PersonalAccessToken {
     /// Active
     pub active: bool,
@@ -254,6 +260,10 @@ impl core::fmt::Display for PersonalAccessTokenScope {
 
 #[derive(Debug)]
 #[expect(clippy::missing_docs_in_private_items, reason = "self documented ;)")]
+#[expect(
+    dead_code,
+    reason = "web_url is carried from the API but not exported by the stripped gitlab_token_expiration metric"
+)]
 /// A common token type
 pub enum Token {
     /// Group token
@@ -273,33 +283,6 @@ pub enum Token {
         token: PersonalAccessToken,
         full_path: String,
     },
-}
-
-impl Token {
-    /// Convert token scopes ([`AccessTokenScope`] or [`PersonalAccessTokenScope`]) into a String
-    pub fn scopes(&self) -> Result<String, anyhow::Error> {
-        let mut res = String::from("[");
-
-        match self {
-            Self::Group { token, .. } | Self::Project { token, .. } => {
-                for scope in &token.scopes {
-                    write!(res, "{scope},").context("failed to write projet|group token scopes")?;
-                }
-            }
-            Self::User { token, .. } => {
-                for scope in &token.scopes {
-                    write!(res, "{scope},").context("failed to write user token scopes")?;
-                }
-            }
-        }
-
-        if res.ends_with(',') {
-            res.pop();
-        }
-
-        res.push(']');
-        Ok(res)
-    }
 }
 
 /// Custom date deserialization function to handle years > 9999

@@ -64,9 +64,15 @@ async fn get_tokens_metrics<
     let mut time = Instant::now();
     let mut res = String::new();
 
-    let items = T::get_all()
+    let mut items = T::get_all()
         .await
         .with_context(|| format!("failed to get {}s", T::type_name()))?;
+
+    // Apply the GITLAB_FILTER allowlist (matches project path_with_namespace /
+    // group path, both surfaced by `TokenFetcher::name()`)
+    if let Some(filter) = &CONFIG.gitlab_filter {
+        items.retain(|item| filter.contains(&item.name().to_ascii_lowercase()));
+    }
 
     info!(
         "got {} {}{} in {:?}",
@@ -185,6 +191,12 @@ async fn get_users_tokens_metrics() -> Result<String, anyhow::Error> {
                 let username = user_ids
                     .get(&personnal_access_token.user_id)
                     .map_or("", |val| val);
+                // Apply the GITLAB_FILTER allowlist (matches the username)
+                if let Some(filter) = &CONFIG.gitlab_filter
+                    && !filter.contains(&username.to_ascii_lowercase())
+                {
+                    continue;
+                }
                 let token = Token::User {
                     token: personnal_access_token,
                     full_path: username.to_owned(),
@@ -214,7 +226,7 @@ async fn get_gitlab_data(sender: mpsc::Sender<Message>) {
 
     // This variable will be [`Message::Set`] parameter
     let mut return_value = String::from(
-        "# HELP gitlab_token_days_remaining Days before Gitlab token expires\n# TYPE gitlab_token_days_remaining gauge\n",
+        "# HELP gitlab_token_expiration Days before GitLab token expires\n# TYPE gitlab_token_expiration gauge\n",
     );
 
     // Using a tokio JoinSet to run get_tokens_metrics() twice concurrently
